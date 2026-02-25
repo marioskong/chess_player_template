@@ -1,107 +1,60 @@
+
 import chess
 import random
 import re
 import torch
 from typing import Optional
 from transformers import AutoTokenizer, AutoModelForCausalLM
-
 from chess_tournament.players import Player
 
 
 class TransformerPlayer(Player):
-    """
-    Tiny LM baseline chess player.
-
-    REQUIRED:
-        Subclasses chess_tournament.players.Player
-    """
 
     UCI_REGEX = re.compile(r"\b([a-h][1-8][a-h][1-8][qrbn]?)\b", re.IGNORECASE)
 
-    def __init__(
-        self,
-        name: str = "TinyLMPlayer",
-        model_id: str = "HuggingFaceTB/SmolLM2-135M-Instruct",
-        temperature: float = 0.7,
-        max_new_tokens: int = 8,
-    ):
+    def __init__(self, name: str = "TransformerPlayer"):
         super().__init__(name)
-
-        self.model_id = model_id
-        self.temperature = temperature
-        self.max_new_tokens = max_new_tokens
-
+        self.model_id = "marioskon/chess-smollm2"
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        # Lazy-loaded components
         self.tokenizer = None
         self.model = None
 
-    # -------------------------
-    # Lazy loading
-    # -------------------------
     def _load_model(self):
         if self.model is None:
-            print(f"[{self.name}] Loading {self.model_id} on {self.device}...")
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
-
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-
-            self.model = AutoModelForCausalLM.from_pretrained(self.model_id)
-            self.model.to(self.device)
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.model = AutoModelForCausalLM.from_pretrained(self.model_id).to(self.device)
             self.model.eval()
 
-    # -------------------------
-    # Prompt
-    # -------------------------
-    def _build_prompt(self, fen: str) -> str:
-        return f"FEN: {fen}\nMove:"
-
-    def _extract_move(self, text: str) -> Optional[str]:
-        match = self.UCI_REGEX.search(text)
-        return match.group(1).lower() if match else None
-
-    def _random_legal(self, fen: str) -> Optional[str]:
+    def _best_legal_move(self, fen: str) -> Optional[str]:
         board = chess.Board(fen)
-        moves = list(board.legal_moves)
-        return random.choice(moves).uci() if moves else None
+        legal_moves = [m.uci() for m in board.legal_moves]
+        if not legal_moves:
+            return None
 
-    # -------------------------
-    # Main API
-    # -------------------------
+        prompt = f"FEN: {fen}\nMove:"
+        best_move, best_score = None, float("-inf")
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+
+        with torch.no_grad():
+            for move in legal_moves:
+                move_ids = self.tokenizer(" " + move, return_tensors="pt").input_ids.to(self.device)
+                full_ids = torch.cat([inputs.input_ids, move_ids], dim=1)
+                out = self.model(full_ids)
+                logits = out.logits[0, inputs.input_ids.shape[1]-1:-1]
+                score = torch.nn.functional.log_softmax(logits, dim=-1)
+                score = score.gather(1, move_ids[0].unsqueeze(1)).sum().item()
+                if score > best_score:
+                    best_score = score
+                    best_move = move
+
+        return best_move
+
     def get_move(self, fen: str) -> Optional[str]:
-
         try:
             self._load_model()
+            return self._best_legal_move(fen)
         except Exception:
-            return self._random_legal(fen)
-
-        prompt = self._build_prompt(fen)
-
-        try:
-            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=self.max_new_tokens,
-                    do_sample=True,
-                    temperature=self.temperature,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                )
-
-            decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-            if decoded.startswith(prompt):
-                decoded = decoded[len(prompt):]
-
-            move = self._extract_move(decoded)
-
-            if move:
-                return move
-
-        except Exception:
-            pass
-
-        return self._random_legal(fen)
+            board = chess.Board(fen)
+            moves = list(board.legal_moves)
+            return random.choice(moves).uci() if moves else None
